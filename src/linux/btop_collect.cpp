@@ -57,6 +57,14 @@ tab-size = 4
 #include "../btop_tools.hpp"
 
 #if defined(GPU_SUPPORT)
+	#include <fcntl.h>
+	#include <linux/perf_event.h>
+	#include <sys/ioctl.h>
+	#include <sys/syscall.h>
+	#if __has_include(<drm/xe_drm.h>)
+		#include <drm/xe_drm.h>
+		#define BTOP_HAVE_XE_DRM
+	#endif
 	// Redefining C++ keywords fortunately has a warning in clang, however it's unavoidable here
 	// since the C library uses "class" as a struct member and keywords are not allowed to be used
 	// as identifiers in C++.
@@ -317,6 +325,47 @@ namespace Gpu {
 		uint32_t device_count = 0;
 		vector<device_paths> devices;
 	}
+
+	//? Intel Xe driver (Arc discrete GPUs such as Battlemage B580, Lunar Lake and newer iGPUs).
+	//? The i915 PMU used by namespace Intel does not exist for xe, so utilization comes from the xe PMU
+	//? when perf_event_open is permitted, otherwise from DRM fdinfo cycle counters of visible processes.
+	namespace Xe {
+		static constexpr int num_classes = 5; //? rcs, bcs, vcs, vecs, ccs (DRM_XE_ENGINE_CLASS_*)
+		static constexpr int max_instances = 8;
+
+		struct pmu_engine {
+			int active_fd = -1;
+			int total_fd = -1;
+			uint64_t prev_active = 0;
+			uint64_t prev_total = 0;
+		};
+
+		struct client_cycles {
+			uint64_t cycles[num_classes] = {};
+		};
+
+		struct device_info {
+			string pdev;                         //? e.g. 0000:6a:00.0
+			std::filesystem::path device;
+			std::filesystem::path hwmon;
+			std::filesystem::path temp_input;    //? empty if no usable temperature sensor
+			std::filesystem::path freq_input;    //? empty if no gt frequency node
+			string render_node;                  //? /dev/dri/renderDN, empty if not found
+			uint32_t pci_device_id = 0;
+			vector<pmu_engine> pmu;              //? empty when the xe PMU is not accessible
+			//? fdinfo accounting, keyed by (pid << 32 | drm-client-id)
+			std::unordered_map<uint64_t, client_cycles> clients;
+			uint64_t prev_total[num_classes] = {};
+			bool have_prev = false;
+		};
+
+		bool initialized = false;
+		bool init();
+		bool shutdown();
+		template <bool is_init> bool collect(gpu_info* gpus_slice);
+		uint32_t device_count = 0;
+		vector<device_info> devices;
+	}
 }
 
 #endif // GPU_SUPPORT
@@ -403,6 +452,7 @@ namespace Shared {
 
 		if (shown_gpus.contains("intel")) {
 			Gpu::Intel::init();
+			Gpu::Xe::init();
 		}
 
 		if (not Gpu::gpu_names.empty()) {
@@ -2211,6 +2261,312 @@ namespace Gpu {
 		template bool collect<1>(gpu_info*);
 	}
 
+	namespace Xe {
+		static const char* const class_names[num_classes] = {"rcs", "bcs", "vcs", "vecs", "ccs"};
+
+		static long long read_ll(const std::filesystem::path& path, long long fallback = 0) {
+			try {
+				return std::stoll(readfile(path, std::to_string(fallback)));
+			} catch (const std::exception&) {
+				return fallback;
+			}
+		}
+
+		static string trim_nl(string s) {
+			while (not s.empty() and (s.back() == '\n' or s.back() == ' ')) s.pop_back();
+			return s;
+		}
+
+		static int perf_open(uint64_t type, uint64_t config) {
+			perf_event_attr attr{};
+			attr.type = static_cast<uint32_t>(type);
+			attr.size = sizeof(attr);
+			attr.config = config;
+			attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED;
+			return static_cast<int>(syscall(SYS_perf_event_open, &attr, -1, 0, -1, 0));
+		}
+
+		//? Event ids and config layout from /sys/devices/xe_<pdev>/{events,format}
+		static constexpr uint64_t event_active_ticks = 0x02;
+		static constexpr uint64_t event_total_ticks = 0x03;
+		static uint64_t engine_config(uint64_t event, int cls, int instance) {
+			return event | (static_cast<uint64_t>(instance) << 12) | (static_cast<uint64_t>(cls) << 20);
+		}
+
+		static uint64_t perf_read(int fd) {
+			uint64_t buf[2] = {0, 0};
+			if (read(fd, buf, sizeof(buf)) != static_cast<ssize_t>(sizeof(buf))) return 0;
+			return buf[0];
+		}
+
+		//? Open xe PMU counters for every engine on gt0. Needs CAP_PERFMON or a relaxed perf_event_paranoid.
+		static void open_pmu(device_info& d) {
+			string pmu_dir = "/sys/devices/xe_" + d.pdev;
+			for (char& c : pmu_dir) if (c == ':') c = '_';
+			std::error_code ec;
+			if (not std::filesystem::is_directory(pmu_dir, ec)) return;
+			const uint64_t type = static_cast<uint64_t>(read_ll(pmu_dir + "/type", -1));
+			if (type == static_cast<uint64_t>(-1)) return;
+
+			for (int cls = 0; cls < num_classes; ++cls) {
+				for (int inst = 0; inst < max_instances; ++inst) {
+					pmu_engine e;
+					e.active_fd = perf_open(type, engine_config(event_active_ticks, cls, inst));
+					if (e.active_fd < 0) break;
+					e.total_fd = perf_open(type, engine_config(event_total_ticks, cls, inst));
+					if (e.total_fd < 0) { close(e.active_fd); break; }
+					e.prev_active = perf_read(e.active_fd);
+					e.prev_total = perf_read(e.total_fd);
+					d.pmu.push_back(e);
+				}
+			}
+			if (d.pmu.empty()) Logger::debug("Xe GPU: PMU not accessible (needs CAP_PERFMON), using DRM fdinfo for utilization");
+		}
+
+		//? Walk /proc/*/fd looking for DRM clients of this device and accumulate their engine cycles and VRAM.
+		//? Only processes whose fdinfo is readable by the current user are visible (all of them when root).
+		struct fdinfo_result {
+			std::unordered_map<uint64_t, client_cycles> clients;
+			uint64_t total_cycles[num_classes] = {};
+			uint64_t vram = 0;
+		};
+
+		static fdinfo_result scan_fdinfo(const device_info& d) {
+			fdinfo_result res;
+			std::error_code ec;
+			for (const auto& proc : std::filesystem::directory_iterator("/proc", ec)) {
+				const string pname = proc.path().filename().string();
+				if (pname.empty() or not isdigit(pname[0])) continue;
+				const uint64_t pid = std::strtoull(pname.c_str(), nullptr, 10);
+
+				for (const auto& fdent : std::filesystem::directory_iterator(proc.path() / "fd", ec)) {
+					std::error_code ec2;
+					const auto target = std::filesystem::read_symlink(fdent.path(), ec2);
+					if (ec2 or not target.native().starts_with("/dev/dri/")) continue;
+
+					std::ifstream f(proc.path() / "fdinfo" / fdent.path().filename());
+					if (not f.good()) continue;
+
+					bool is_xe = false, our_dev = false, have_id = false;
+					uint64_t cid = 0, vram = 0;
+					client_cycles cc;
+					uint64_t totals[num_classes] = {};
+					string line;
+					while (std::getline(f, line)) {
+						const auto colon = line.find(':');
+						if (colon == string::npos) continue;
+						const string key = line.substr(0, colon);
+						const string val = trim_nl(line.substr(line.find_first_not_of(" \t", colon + 1) == string::npos ? line.size() : line.find_first_not_of(" \t", colon + 1)));
+						if (key == "drm-driver") is_xe = (val == "xe");
+						else if (key == "drm-pdev") our_dev = (val == d.pdev);
+						else if (key == "drm-client-id") { cid = std::strtoull(val.c_str(), nullptr, 10); have_id = true; }
+						else if (key == "drm-total-vram0") vram = std::strtoull(val.c_str(), nullptr, 10) * 1024; //? reported in KiB
+						else if (key.starts_with("drm-cycles-") or key.starts_with("drm-total-cycles-")) {
+							const bool total = key.starts_with("drm-total-");
+							const string cname = key.substr(total ? 17 : 11);
+							for (int i = 0; i < num_classes; ++i) {
+								if (cname != class_names[i]) continue;
+								const uint64_t v = std::strtoull(val.c_str(), nullptr, 10);
+								(total ? totals[i] : cc.cycles[i]) = v;
+							}
+						}
+					}
+					if (not is_xe or not our_dev or not have_id) continue;
+
+					//? Several fds can refer to the same client; count each client once.
+					const uint64_t key = (pid << 32) ^ cid;
+					if (res.clients.contains(key)) continue;
+					res.clients[key] = cc;
+					res.vram += vram;
+					for (int i = 0; i < num_classes; ++i)
+						res.total_cycles[i] = std::max(res.total_cycles[i], totals[i]);
+				}
+			}
+			return res;
+		}
+
+		bool init() {
+			if (initialized) return false;
+			devices.clear();
+
+			const std::filesystem::path drm_root("/sys/class/drm");
+			std::error_code ec;
+			if (not std::filesystem::is_directory(drm_root, ec)) return false;
+
+			for (const auto& entry : std::filesystem::directory_iterator(drm_root, ec)) {
+				const string fname = entry.path().filename().string();
+				if (not fname.starts_with("card") or fname.size() <= 4
+					or not std::ranges::all_of(fname.begin() + 4, fname.end(), [](char c) { return c >= '0' and c <= '9'; })) continue;
+
+				const auto dev = entry.path() / "device";
+				if (trim_nl(readfile(dev / "vendor", "")) != "0x8086") continue;
+				const auto driver = std::filesystem::read_symlink(dev / "driver", ec);
+				if (ec or driver.filename().string() != "xe") continue;
+
+				device_info d;
+				d.device = dev;
+				d.pdev = std::filesystem::read_symlink(dev, ec).filename().string();
+				if (ec or d.pdev.empty()) {
+					d.pdev = trim_nl(readfile(dev / "uevent", ""));
+					const auto pos = d.pdev.find("PCI_SLOT_NAME=");
+					d.pdev = pos == string::npos ? "" : d.pdev.substr(pos + 14, d.pdev.find('\n', pos) - pos - 14);
+				}
+				try {
+					d.pci_device_id = (uint32_t)std::stoul(readfile(dev / "device", "0"), nullptr, 0);
+				} catch (const std::exception&) {}
+
+				//? Render node for DRM queries (VRAM size/usage)
+				for (const auto& n : std::filesystem::directory_iterator(dev / "drm", ec)) {
+					if (n.path().filename().string().starts_with("renderD"))
+						d.render_node = "/dev/dri/" + n.path().filename().string();
+				}
+
+				//? Core clock of the first GT
+				const auto freq = dev / "tile0" / "gt0" / "freq0" / "act_freq";
+				if (std::filesystem::exists(freq)) d.freq_input = freq;
+
+				//? Temperature: hwmon exposes labelled sensors, prefer the package one
+				const auto hwmon_dir = dev / "hwmon";
+				for (const auto& h : std::filesystem::directory_iterator(hwmon_dir, ec)) {
+					if (not h.is_directory()) continue;
+					d.hwmon = h.path();
+					for (const char* want : {"pkg", "vram"}) {
+						for (int n = 1; n < 32 and d.temp_input.empty(); ++n) {
+							const auto label = d.hwmon / fmt::format("temp{}_label", n);
+							if (trim_nl(readfile(label, "")) == want) d.temp_input = d.hwmon / fmt::format("temp{}_input", n);
+						}
+					}
+					break;
+				}
+
+				open_pmu(d);
+				devices.push_back(std::move(d));
+			}
+
+			device_count = (uint32_t)devices.size();
+			if (device_count == 0) return false;
+
+			const size_t offset = Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count;
+			gpus.resize(gpus.size() + device_count);
+			gpu_names.resize(offset + device_count);
+			for (uint32_t i = 0; i < device_count; ++i) {
+				char* name = get_intel_device_name(fmt::format("0x{:04x}", devices[i].pci_device_id).c_str());
+				gpu_names[offset + i] = name ? string(name) : fmt::format("Intel GPU (8086:{:04x})", devices[i].pci_device_id);
+				free(name);
+			}
+
+			initialized = true;
+			Logger::info("Using xe driver for {} Intel GPU(s)", device_count);
+			Xe::collect<1>(gpus.data() + offset);
+			return true;
+		}
+
+		bool shutdown() {
+			if (not initialized) return false;
+			for (auto& d : devices) {
+				for (auto& e : d.pmu) { close(e.active_fd); close(e.total_fd); }
+			}
+			devices.clear();
+			device_count = 0;
+			initialized = false;
+			return true;
+		}
+
+		template <bool is_init> bool collect(gpu_info* gpus_slice) {
+			if (not initialized) return false;
+
+			for (uint32_t i = 0; i < device_count; ++i) {
+				gpu_info& gpu = gpus_slice[i];
+				device_info& d = devices[i];
+
+				if constexpr (is_init) {
+					gpu.supported_functions = {
+						.gpu_utilization = true,
+						.mem_utilization = false,
+						.gpu_clock = not d.freq_input.empty(),
+						.mem_clock = false,
+						.pwr_usage = false,
+						.pwr_state = false,
+						.temp_info = not d.temp_input.empty(),
+						.mem_total = not d.render_node.empty(),
+						.mem_used = not d.render_node.empty(),
+						.pcie_txrx = false,
+						.encoder_utilization = false,
+						.decoder_utilization = false,
+					};
+				}
+
+				//? Per-process view; also the utilization source when the PMU is unavailable
+				const auto fdinfo = scan_fdinfo(d);
+
+				double util = 0;
+				if (not d.pmu.empty()) {
+					for (auto& e : d.pmu) {
+						const uint64_t active = perf_read(e.active_fd), total = perf_read(e.total_fd);
+						if (total > e.prev_total)
+							util = std::max(util, 100.0 * (double)(active - e.prev_active) / (double)(total - e.prev_total));
+						e.prev_active = active;
+						e.prev_total = total;
+					}
+				} else if (d.have_prev) {
+					for (int c = 0; c < num_classes; ++c) {
+						if (fdinfo.total_cycles[c] <= d.prev_total[c]) continue;
+						uint64_t delta = 0;
+						for (const auto& [key, cc] : fdinfo.clients) {
+							const auto old = d.clients.find(key);
+							if (old != d.clients.end() and cc.cycles[c] >= old->second.cycles[c])
+								delta += cc.cycles[c] - old->second.cycles[c];
+						}
+						util = std::max(util, 100.0 * (double)delta / (double)(fdinfo.total_cycles[c] - d.prev_total[c]));
+					}
+				}
+				d.clients = fdinfo.clients;
+				std::copy(std::begin(fdinfo.total_cycles), std::end(fdinfo.total_cycles), std::begin(d.prev_total));
+				d.have_prev = true;
+				gpu.gpu_percent.at("gpu-totals").push_back(std::clamp((long long)std::round(util), 0LL, 100LL));
+
+				if (not d.freq_input.empty()) gpu.gpu_clock_speed = (unsigned int)read_ll(d.freq_input); //? already MHz
+				if (not d.temp_input.empty()) gpu.temp.push_back(read_ll(d.temp_input) / 1000);
+
+			#ifdef BTOP_HAVE_XE_DRM
+				if (not d.render_node.empty()) {
+					const int fd = open(d.render_node.c_str(), O_RDWR | O_CLOEXEC);
+					if (fd >= 0) {
+						drm_xe_device_query q{};
+						q.query = DRM_XE_DEVICE_QUERY_MEM_REGIONS;
+						if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0 and q.size > 0) {
+							vector<char> buf(q.size);
+							q.data = reinterpret_cast<uintptr_t>(buf.data());
+							if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0) {
+								const auto* regions = reinterpret_cast<const drm_xe_query_mem_regions*>(buf.data());
+								for (uint32_t r = 0; r < regions->num_mem_regions; ++r) {
+									const auto& mr = regions->mem_regions[r];
+									//? dGPUs have a VRAM region; iGPUs only report system memory
+									if (mr.mem_class == DRM_XE_MEM_REGION_CLASS_VRAM or regions->num_mem_regions == 1) {
+										gpu.mem_total = mr.total_size;
+										gpu.mem_used = mr.used;
+										break;
+									}
+								}
+							}
+						}
+						close(fd);
+					}
+				}
+			#endif
+				//? The kernel reports 0 used memory without CAP_PERFMON; fall back to visible clients' VRAM.
+				if (gpu.mem_used == 0) gpu.mem_used = fdinfo.vram;
+				if (gpu.mem_total > 0)
+					gpu.gpu_percent.at("gpu-vram-totals").push_back(
+						std::clamp((long long)std::round((double)gpu.mem_used * 100.0 / (double)gpu.mem_total), 0LL, 100LL));
+			}
+			return true;
+		}
+
+		template bool collect<0>(gpu_info*);
+		template bool collect<1>(gpu_info*);
+	}
+
 	//? Collect data from GPU-specific libraries
 	auto collect(bool no_update) -> vector<gpu_info>& {
 		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
@@ -2222,6 +2578,7 @@ namespace Gpu {
 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
 		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
+		Xe::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count); // size = Xe::device_count
 
 		//* Calculate average usage
 		long long avg = 0;
